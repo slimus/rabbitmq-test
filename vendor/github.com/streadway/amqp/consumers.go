@@ -6,30 +6,16 @@
 package amqp
 
 import (
+	"fmt"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 )
 
 var consumerSeq uint64
 
-const consumerTagLengthMax = 0xFF // see writeShortstr
-
 func uniqueConsumerTag() string {
-	return commandNameBasedUniqueConsumerTag(os.Args[0])
-}
-
-func commandNameBasedUniqueConsumerTag(commandName string) string {
-	tagPrefix := "ctag-"
-	tagInfix := commandName
-	tagSuffix := "-" + strconv.FormatUint(atomic.AddUint64(&consumerSeq, 1), 10)
-
-	if len(tagPrefix)+len(tagInfix)+len(tagSuffix) > consumerTagLengthMax {
-		tagInfix = "streadway/amqp"
-	}
-
-	return tagPrefix + tagInfix + tagSuffix
+	return fmt.Sprintf("ctag-%s-%d", os.Args[0], atomic.AddUint64(&consumerSeq, 1))
 }
 
 type consumerBuffers map[string]chan *Delivery
@@ -37,103 +23,93 @@ type consumerBuffers map[string]chan *Delivery
 // Concurrent type that manages the consumerTag ->
 // ingress consumerBuffer mapping
 type consumers struct {
-	sync.WaitGroup               // one for buffer
-	closed         chan struct{} // signal buffer
-
-	sync.Mutex // protects below
-	chans      consumerBuffers
+	sync.Mutex
+	chans consumerBuffers
 }
 
 func makeConsumers() *consumers {
-	return &consumers{
-		closed: make(chan struct{}),
-		chans:  make(consumerBuffers),
-	}
+	return &consumers{chans: make(consumerBuffers)}
 }
 
-func (subs *consumers) buffer(in chan *Delivery, out chan Delivery) {
-	defer close(out)
-	defer subs.Done()
-
-	var inflight = in
+func bufferDeliveries(in chan *Delivery, out chan Delivery) {
 	var queue []*Delivery
+	var queueIn = in
 
 	for delivery := range in {
-		queue = append(queue, delivery)
+		select {
+		case out <- *delivery:
+			// delivered immediately while the consumer chan can receive
+		default:
+			queue = append(queue, delivery)
+		}
 
 		for len(queue) > 0 {
 			select {
-			case <-subs.closed:
-				// closed before drained, drop in-flight
-				return
-
-			case delivery, consuming := <-inflight:
-				if consuming {
-					queue = append(queue, delivery)
-				} else {
-					inflight = nil
-				}
-
 			case out <- *queue[0]:
 				queue = queue[1:]
+			case delivery, open := <-queueIn:
+				if open {
+					queue = append(queue, delivery)
+				} else {
+					// stop receiving to drain the queue
+					queueIn = nil
+				}
 			}
 		}
 	}
+
+	close(out)
 }
 
 // On key conflict, close the previous channel.
-func (subs *consumers) add(tag string, consumer chan Delivery) {
-	subs.Lock()
-	defer subs.Unlock()
+func (me *consumers) add(tag string, consumer chan Delivery) {
+	me.Lock()
+	defer me.Unlock()
 
-	if prev, found := subs.chans[tag]; found {
+	if prev, found := me.chans[tag]; found {
 		close(prev)
 	}
 
 	in := make(chan *Delivery)
-	subs.chans[tag] = in
+	go bufferDeliveries(in, consumer)
 
-	subs.Add(1)
-	go subs.buffer(in, consumer)
+	me.chans[tag] = in
 }
 
-func (subs *consumers) cancel(tag string) (found bool) {
-	subs.Lock()
-	defer subs.Unlock()
+func (me *consumers) close(tag string) (found bool) {
+	me.Lock()
+	defer me.Unlock()
 
-	ch, found := subs.chans[tag]
+	ch, found := me.chans[tag]
 
 	if found {
-		delete(subs.chans, tag)
+		delete(me.chans, tag)
 		close(ch)
 	}
 
 	return found
 }
 
-func (subs *consumers) close() {
-	subs.Lock()
-	defer subs.Unlock()
+func (me *consumers) closeAll() {
+	me.Lock()
+	defer me.Unlock()
 
-	close(subs.closed)
-
-	for tag, ch := range subs.chans {
-		delete(subs.chans, tag)
+	for _, ch := range me.chans {
 		close(ch)
 	}
 
-	subs.Wait()
+	me.chans = make(consumerBuffers)
 }
 
 // Sends a delivery to a the consumer identified by `tag`.
 // If unbuffered channels are used for Consume this method
 // could block all deliveries until the consumer
 // receives on the other end of the channel.
-func (subs *consumers) send(tag string, msg *Delivery) bool {
-	subs.Lock()
-	defer subs.Unlock()
+func (me *consumers) send(tag string, msg *Delivery) bool {
+	me.Lock()
+	defer me.Unlock()
 
-	buffer, found := subs.chans[tag]
+	buffer, found := me.chans[tag]
 	if found {
 		buffer <- msg
 	}
