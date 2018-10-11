@@ -1,0 +1,12 @@
+version: '2'
+
+services:
+  mq:
+    image: rabbitmq:3.7-management-alpine
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    environment:
+      - RABBITMQ_DEFAULT_USER=test
+      - RABBITMQ_DEFAULT_PASS=test
+      - RABBITMQ_DEFAULT_VHOST=test
